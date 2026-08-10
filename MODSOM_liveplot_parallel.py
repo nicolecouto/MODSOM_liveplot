@@ -1130,10 +1130,7 @@ class RecordProcessorThread(threading.Thread):
 
                 tof_up[i] = float(u)
                 tof_dn[i] = float(d)
-                if tag == "TTV1":
-                    dtof[i] = float(dt) + 400
-                else:
-                    dtof[i] = float(dt)
+                dtof[i] = float(dt)
                 err[i] = float(int(e))
                 upk[i] = float(int(up))
                 dpk[i] = float(int(dn))
