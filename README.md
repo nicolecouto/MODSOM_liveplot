@@ -44,5 +44,11 @@ python MODSOM_liveplot.py --serial serial_port_name -baud 230400
 
 (If you are testing locally without a live hardware feed, you may need to run modsom_generator.py alongside the plotter to generate the simulated data stream).
 
+To view live spectra while another process holds the serial port and is saving the raw data itself (e.g. a logger writing `.modraw` files to disk), point Faster_app.py at that output directory instead of the port - it never opens the port, it just tails whichever file in the directory is currently newest and follows along as new files appear:
+
+python Faster_app.py --watch-dir /path/to/directory --epsi-scan-length 1024
+
+`--epsi-scan-length` (default 1024) sets the sample count used for the EFE4/epsi PSD panel.
+
 
 

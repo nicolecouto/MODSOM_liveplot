@@ -7,11 +7,14 @@ Inputs supported (mutually exclusive):
   --serial PORT --baud 115200
   --tcp HOST PORT            (connect as TCP client)
   --tcp-listen PORT          (listen as TCP server; accepts ONE client)
+  --watch-dir DIR            (tail whichever file is currently newest in DIR)
 
 Speed design:
 - Fixed-size circular buffers (NumPy) for all channels (no dynamic list growth).
 - Batch append for EFE4/TTV where possible.
 - GUI plots only last --window seconds (default 5s) from ring buffers.
+- EFE4 PSD uses a fixed sample count (--epsi-scan-length, default 1024), not a time
+  window, so every update has the same number of frequency bins.
 
 Serial stop:
 - When app exits, sends "som.stop\r\n" only if using --serial.
@@ -19,16 +22,24 @@ Serial stop:
 Notes:
 - TCP is a byte stream (like serial): the state machine parses records exactly the same.
 - If you want multiple TCP listeners, TCP is not ideal (use UDP or implement fan-out).
+- --watch-dir never opens the serial port itself - it watches a directory some other
+  process (which owns the port) is writing raw files into, and always tails whichever
+  file in there is currently newest, following along as that process rotates to new
+  files. This is how you can visualize live while another process is simultaneously
+  logging the same stream to disk, without both processes contending for the port.
 """
 
 import argparse
+import glob
+import os
 import threading
 import queue
 import time
 import struct
 import socket
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -143,6 +154,19 @@ class RingBuffer:
         t0 = t[-1] - seconds
         j = np.searchsorted(t, t0, side="left")
         return t[j:], y[j:]
+
+    def snapshot_last_n(self, tbuf: "RingBuffer", n: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Like snapshot_last_seconds, but a fixed sample count instead of a time window -
+        every call returns the same length (once enough samples exist), so the resulting
+        PSD's frequency bins don't drift update to update."""
+        n = int(n)
+        with tbuf._lock, self._lock:
+            m = min(tbuf._n, self._n, n)
+            if m <= 1:
+                return np.empty(0), np.empty(0)
+            t = _ordered_copy(tbuf._x, tbuf._i, m)
+            y = _ordered_copy(self._x, self._i, m)
+        return t, y
 
     def size(self) -> int:
         with self._lock:
@@ -284,6 +308,111 @@ class TCPListenThread(threading.Thread):
         if self._err:
             raise RuntimeError(f"TCP listen failed: {self._err}")
         return self.client_sock
+
+
+def _list_candidates(watch_dir: str, pattern: str) -> List[str]:
+    """Every file in watch_dir matching pattern, oldest to newest (by mtime, filename as
+    tiebreaker). The caller wants candidates[-1] - "the current newest file"."""
+    entries = []
+    for p in glob.glob(os.path.join(watch_dir, pattern)):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        entries.append((st.st_mtime, p))
+    entries.sort(key=lambda e: (e[0], e[1]))
+    return [p for _, p in entries]
+
+
+class DirWatchSource:
+    """A '.read(n) -> bytes' source (same shape as SocketSource) that watches watch_dir
+    and always tails whichever matching file is currently newest - never any other file.
+
+    This deliberately does not try to preserve every byte across a rotation: if a newer
+    file appears while there's still unread data in the old one, that leftover is simply
+    dropped. The point is "always looking at the most recent data" for a live view, not a
+    complete byte-exact record - something else (the process actually saving this data,
+    outside this repo) already owns that.
+    """
+
+    def __init__(
+        self,
+        watch_dir: str,
+        pattern: str,
+        poll_interval_s: float,
+        stop_event: threading.Event,
+        seed_bytes: int,
+    ):
+        self.watch_dir = watch_dir
+        self.pattern = pattern
+        self.poll_interval_s = float(poll_interval_s)
+        self.stop_event = stop_event
+        self.seed_bytes = int(seed_bytes)
+        self.current_path: Optional[str] = None
+        self.current_fh = None
+        self._seeded = False
+
+    def _open(self, path: str, seed: bool):
+        fh = open(path, "rb")
+        if seed and self.seed_bytes > 0:
+            size = os.fstat(fh.fileno()).st_size
+            if size > self.seed_bytes:
+                fh.seek(size - self.seed_bytes)
+        self.current_path = path
+        self.current_fh = fh
+
+    def _replaced_on_disk(self) -> bool:
+        """True if current_path was truncated+rewritten in place (same name, new inode) or
+        removed, rather than rotated to a new filename."""
+        if self.current_path is None or self.current_fh is None:
+            return False
+        try:
+            disk_ino = os.stat(self.current_path).st_ino
+        except OSError:
+            return True
+        try:
+            open_ino = os.fstat(self.current_fh.fileno()).st_ino
+        except OSError:
+            return True
+        return disk_ino != open_ino
+
+    def read(self, n: int) -> bytes:
+        while not self.stop_event.is_set():
+            if self.current_fh is None:
+                candidates = _list_candidates(self.watch_dir, self.pattern)
+                if not candidates:
+                    time.sleep(self.poll_interval_s)
+                    continue
+                self._open(candidates[-1], seed=not self._seeded)
+                self._seeded = True
+                continue
+
+            data = self.current_fh.read(n)
+            if data:
+                return data
+
+            # Caught up to this file's current EOF.
+            if self._replaced_on_disk():
+                self.current_fh.close()
+                self.current_fh = None
+                continue
+
+            candidates = _list_candidates(self.watch_dir, self.pattern)
+            if candidates and candidates[-1] != self.current_path:
+                self.current_fh.close()
+                self._open(candidates[-1], seed=False)
+                continue
+
+            time.sleep(self.poll_interval_s)
+
+        return b""
+
+    def close(self):
+        if self.current_fh is not None:
+            try:
+                self.current_fh.close()
+            except Exception:
+                pass
 
 
 # -----------------------------
@@ -734,11 +863,12 @@ VNAV_COLORS = {
 # GUI Windows
 # -----------------------------
 class EFE4Window(QtWidgets.QMainWindow):
-    def __init__(self, buf: EFE4Buffers, window_seconds: float = 5.0):
+    def __init__(self, buf: EFE4Buffers, window_seconds: float = 5.0, epsi_scan_length: int = 1024):
         super().__init__()
         self.buf = buf
         self.window_seconds = float(window_seconds)
-        self.setWindowTitle("EFE4 (fast)")
+        self.epsi_scan_length = int(epsi_scan_length)
+        self.setWindowTitle(f"EFE4 (fast) - epsi scan length {self.epsi_scan_length}")
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -759,6 +889,9 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.c_a1 = self.p_a.plot([], [], pen=pg.mkPen(EFE4_COLORS["a1"]), name="a1")
         self.c_a2 = self.p_a.plot([], [], pen=pg.mkPen(EFE4_COLORS["a2"]), name="a2")
         self.c_a3 = self.p_a.plot([], [], pen=pg.mkPen(EFE4_COLORS["a3"]), name="a3")
+
+        self.scan_info_label = QtWidgets.QLabel("scan center: -- | duration: -- | length: --")
+        right.addWidget(self.scan_info_label)
 
         self.p_psd = pg.PlotWidget()
         self.p_psd.setLogMode(x=True, y=True)
@@ -800,10 +933,29 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.c_s1.setData(tr, s1); self.c_s2.setData(tr, s2)
         self.c_a1.setData(tr, a1); self.c_a2.setData(tr, a2); self.c_a3.setData(tr, a3)
 
-        for name, arr in [("t1", y1), ("t2", y2), ("s1", s1), ("s2", s2), ("a1", a1), ("a2", a2), ("a3", a3)]:
-            f, p = psd_fft(t, arr.astype(np.float64))
-            if f is not None:
-                self.psd[name].setData(f, p)
+        # PSD uses a fixed sample-count window (epsi_scan_length), not the time-based
+        # window above - every update gets the same number of frequency bins.
+        pt, py1 = self.buf.t1.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+        if pt.size >= 32:
+            _, py2 = self.buf.t2.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+            _, ps1 = self.buf.s1.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+            _, ps2 = self.buf.s2.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+            _, pa1 = self.buf.a1.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+            _, pa2 = self.buf.a2.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+            _, pa3 = self.buf.a3.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+
+            for name, arr in [("t1", py1), ("t2", py2), ("s1", ps1), ("s2", ps2),
+                               ("a1", pa1), ("a2", pa2), ("a3", pa3)]:
+                f, p = psd_fft(pt, arr.astype(np.float64))
+                if f is not None:
+                    self.psd[name].setData(f, p)
+
+            center_time = datetime.fromtimestamp((pt[0] + pt[-1]) / 2.0, tz=timezone.utc)
+            duration_s = pt[-1] - pt[0]
+            self.scan_info_label.setText(
+                f"scan center: {center_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} UTC | "
+                f"duration: {duration_s:.3f} s | length: {pt.size} samples"
+            )
 
         f = np.logspace(-1, 2, 200)
         self.nf24.setData(f, np.full_like(f, 1e-12))
@@ -951,10 +1103,11 @@ class VNAVWindow(QtWidgets.QMainWindow):
 # Window manager
 # -----------------------------
 class WindowManager(QtCore.QObject):
-    def __init__(self, buffers: Dict[str, object], window_seconds: float, parent=None):
+    def __init__(self, buffers: Dict[str, object], window_seconds: float, epsi_scan_length: int = 1024, parent=None):
         super().__init__(parent)
         self.buffers = buffers
         self.window_seconds = float(window_seconds)
+        self.epsi_scan_length = int(epsi_scan_length)
 
         self.w_efe4: Optional[EFE4Window] = None
         self.w_ttv: Optional[TTVWindow] = None
@@ -969,7 +1122,7 @@ class WindowManager(QtCore.QObject):
         if self.w_efe4 is None:
             b: EFE4Buffers = self.buffers["EFE4"]  # type: ignore
             if b.t.size() > 10:
-                self.w_efe4 = EFE4Window(b, self.window_seconds)
+                self.w_efe4 = EFE4Window(b, self.window_seconds, self.epsi_scan_length)
                 self.w_efe4.show()
 
         if self.w_ttv is None:
@@ -994,12 +1147,14 @@ def _parse_host_port(two: Tuple[str, str]) -> Tuple[str, int]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fast MOD-SOM parser + plotting with ring buffers (file/serial/TCP)")
+    ap = argparse.ArgumentParser(description="Fast MOD-SOM parser + plotting with ring buffers (file/serial/TCP/watch-dir)")
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--file", "-f", help="Path to input file")
     group.add_argument("--serial", "-s", help="Serial port (e.g. /dev/tty.usbserial)")
     group.add_argument("--tcp", nargs=2, metavar=("HOST", "PORT"), help="Connect as TCP client to HOST PORT")
     group.add_argument("--tcp-listen", type=int, metavar="PORT", help="Listen as TCP server on PORT (accept 1 client)")
+    group.add_argument("--watch-dir", help="Directory another process is writing raw files into; "
+                                            "always tails whichever file is currently newest")
 
     ap.add_argument("--baud", "-b", type=int, default=115200, help="Serial baudrate")
     ap.add_argument("--window", type=float, default=5.0, help="Plot window seconds (default 5)")
@@ -1008,9 +1163,17 @@ def main():
     ap.add_argument("--ttv-fs", type=float, default=50.0, help="TTV nominal sample rate for buffer sizing")
     ap.add_argument("--vnav-fs", type=float, default=50.0, help="VNAV nominal sample rate for buffer sizing")
     ap.add_argument("--tcp-bind", default="0.0.0.0", help="Bind address for --tcp-listen (default 0.0.0.0)")
+    ap.add_argument("--pattern", default="*.modraw", help="--watch-dir: glob pattern for candidate files (default *.modraw)")
+    ap.add_argument("--poll-interval", type=float, default=0.2,
+                     help="--watch-dir: seconds between checks for new bytes/new files (default 0.2)")
+    ap.add_argument("--seed-bytes", type=int, default=2_000_000,
+                     help="--watch-dir: bytes to seed from the end of the newest file on startup, "
+                          "so plots aren't blank while waiting for new data (default ~2MB, 0 to disable)")
+    ap.add_argument("--epsi-scan-length", type=int, default=1024,
+                     help="Sample count used for the EFE4 (epsi) PSD window (default 1024)")
     args = ap.parse_args()
 
-    cap_efe4 = max(1024, int(np.ceil(args.buffer_seconds * args.efe4_fs)))
+    cap_efe4 = max(1024, int(np.ceil(args.buffer_seconds * args.efe4_fs)), args.epsi_scan_length)
     cap_ttv = max(1024, int(np.ceil(args.buffer_seconds * args.ttv_fs)))
     cap_vnav = max(1024, int(np.ceil(args.buffer_seconds * args.vnav_fs)))
 
@@ -1041,6 +1204,7 @@ def main():
     ser_obj = None
     sock_src: Optional[SocketSource] = None
     tcp_listen_thread: Optional[TCPListenThread] = None
+    dirwatch_src: Optional[DirWatchSource] = None
     using_serial = False
 
     if args.file:
@@ -1103,7 +1267,20 @@ def main():
         )
         source_thread.start()
 
-    manager = WindowManager(buffers, window_seconds=args.window)
+    elif args.watch_dir:
+        dirwatch_src = DirWatchSource(
+            args.watch_dir, args.pattern, args.poll_interval, stop_event, args.seed_bytes,
+        )
+        source_thread = ByteSourceThread(
+            dirwatch_src,
+            is_stream=True,
+            out_queue=byte_queue,
+            stop_event=stop_event,
+            start_command=None,
+        )
+        source_thread.start()
+
+    manager = WindowManager(buffers, window_seconds=args.window, epsi_scan_length=args.epsi_scan_length)
 
     def on_quit():
         stop_event.set()
@@ -1153,6 +1330,9 @@ def main():
                 ser_obj.close()
             except Exception:
                 pass
+
+        if dirwatch_src is not None:
+            dirwatch_src.close()
 
     app.aboutToQuit.connect(on_quit)
     app.exec_()
