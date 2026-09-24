@@ -44,7 +44,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 try:
@@ -871,12 +871,12 @@ EFE4_COLORS_LIGHT = {
     "a3": (245, 199, 118),
 }
 # Dark mode: the same hue for each channel as light mode, but vivid, so lines pop on
-# black. t1/t2 are bright blue / cyan; s1 is the darker green and s2 pure green, as in
+# black. t1/t2 are bright blue / cyan; s1 is a dark green and s2 pure green, as in
 # light mode; a1/a2/a3 are MATLAB 'm'/'r'/'y'.
 EFE4_COLORS_DARK = {
     "t1": (30, 144, 255),
     "t2": (0, 255, 255),
-    "s1": (0, 150, 0),
+    "s1": (0, 110, 0),
     "s2": (0, 255, 0),
     "a1": (255, 0, 255),
     "a2": (255, 0, 0),
@@ -946,6 +946,32 @@ class TimeAxis(pg.AxisItem):
                 for v in values]
 
 
+class _LineSample(QtWidgets.QWidget):
+    """Short line drawn with a curve's pen, as a legend sample."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(30, 14)
+        self._pen = QtGui.QPen()
+
+    def setPen(self, pen: QtGui.QPen):
+        self._pen = QtGui.QPen(pen)
+        self._pen.setWidthF(max(2.0, pen.widthF()))  # 1 px is too faint for a 30 px sample
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setPen(self._pen)
+        y = self.height() / 2
+        painter.drawLine(QtCore.QPointF(2, y), QtCore.QPointF(self.width() - 2, y))
+
+
+class _ClickableLabel(QtWidgets.QLabel):
+    clicked = QtCore.pyqtSignal()
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+
 class EFE4Window(QtWidgets.QMainWindow):
     def __init__(self, buf: EFE4Buffers, epsi_scan_length: int = 1024):
         super().__init__()
@@ -980,6 +1006,7 @@ class EFE4Window(QtWidgets.QMainWindow):
             last = i == len(panels) - 1
             p = pg.PlotWidget(axisItems={"bottom": self.time_axis} if last else None)
             p.setMouseEnabled(x=False, y=True)
+            p.hideButtons()  # the hover "A" auto-range button would fight the fixed x-range
             # Channel label written horizontally in the top-left corner rather than as a
             # rotated axis label, which got cut off in panels this short. With no axis
             # label, pyqtgraph also doesn't add its "(x1e-06)"-style multiplier, so tick
@@ -1050,12 +1077,47 @@ class EFE4Window(QtWidgets.QMainWindow):
         for line in self.psd_grid:
             line.setZValue(-100)  # behind the spectra
             self.p_psd.addItem(line, ignoreBounds=True)
-        self.psd_legend = self.p_psd.addLegend()
         right.addWidget(self.p_psd)
-        self.psd = {name: self.p_psd.plot([], [], name=name) for name in EFE4Buffers.CHANNELS}
-        self.nf24 = self.p_psd.plot([], [], name="24-bit NF")
-        self.nf20 = self.p_psd.plot([], [], name="20-bit NF")
-        self.nf16 = self.p_psd.plot([], [], name="16-bit NF")
+        self.psd = {name: self.p_psd.plot([], []) for name in EFE4Buffers.CHANNELS}
+        self.nf24 = self.p_psd.plot([], [])
+        self.nf20 = self.p_psd.plot([], [])
+        self.nf16 = self.p_psd.plot([], [])
+
+        # Legend with a checkbox per spectrum / noise floor to show or hide it (the time
+        # series are always shown). pyqtgraph's LegendItem can't hold checkboxes, so this
+        # is a small Qt panel floated over the top-left of the PSD plot instead. Each row
+        # is checkbox, line sample (drawn with the curve's pen), name; clicking the name
+        # also toggles. Colors are set in apply_theme.
+        self.psd_toggles = QtWidgets.QWidget(self.p_psd)
+        self.psd_toggles.setObjectName("psdToggles")
+        self.psd_toggles.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        box = QtWidgets.QVBoxLayout(self.psd_toggles)
+        box.setContentsMargins(6, 4, 8, 4)
+        box.setSpacing(0)
+        self.psd_checks = {}
+        self.psd_samples = {}
+        self.psd_names = []
+        self.psd_entries = list(self.psd.items()) + [
+            ("24-bit NF", self.nf24), ("20-bit NF", self.nf20), ("16-bit NF", self.nf16)]
+        for name, curve in self.psd_entries:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            cb = QtWidgets.QCheckBox()
+            cb.setChecked(True)
+            cb.toggled.connect(curve.setVisible)
+            sample = _LineSample()
+            label = _ClickableLabel(name)
+            label.clicked.connect(cb.toggle)
+            row.addWidget(cb)
+            row.addWidget(sample)
+            row.addWidget(label)
+            row.addStretch(1)
+            box.addLayout(row)
+            self.psd_checks[name] = cb
+            self.psd_samples[name] = sample
+            self.psd_names.append(label)
+        self.psd_toggles.adjustSize()
+        self.psd_toggles.move(80, 20)
 
         self.apply_theme("dark")
 
@@ -1087,9 +1149,14 @@ class EFE4Window(QtWidgets.QMainWindow):
             curve.setPen(pg.mkPen(rgb, style=QtCore.Qt.DashLine))
         for line in self.psd_grid:
             line.setPen(pg.mkPen(th["grid"]))
-        self.psd_legend.setLabelTextColor(th["fg"])
-        for _, label in self.psd_legend.items:  # setLabelTextColor doesn't redraw existing labels
-            label.setText(label.text)
+        r, g, b = th["bg"]
+        self.psd_toggles.setStyleSheet(
+            "#psdToggles { background-color: rgba(%d, %d, %d, 210); border: 1px solid rgb%s; }"
+            % (r, g, b, str(th["grid"])))
+        for name, curve in self.psd_entries:
+            self.psd_samples[name].setPen(curve.opts["pen"])
+        for label in self.psd_names:
+            label.setStyleSheet("color: #%02x%02x%02x;" % th["fg"])
         self.theme_button.setText("Dark mode" if not dark else "Light mode")
 
     def update_plots(self):
