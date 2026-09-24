@@ -870,13 +870,17 @@ EFE4_COLORS_LIGHT = {
     "a2": (235, 64, 61),
     "a3": (245, 199, 118),
 }
-# Dark mode: same hues, but the three too dark to see on black (t1 navy, s1 dark green,
-# a1 dark purple) are blended 40% toward white; the rest are unchanged.
+# Dark mode: the same hue for each channel as light mode, but vivid, so lines pop on
+# black. t1/t2 are bright blue / cyan; s1 is the darker green and s2 pure green, as in
+# light mode; a1/a2/a3 are MATLAB 'm'/'r'/'y'.
 EFE4_COLORS_DARK = {
-    **EFE4_COLORS_LIGHT,
-    "t1": (119, 149, 186),
-    "s1": (138, 182, 148),
-    "a1": (179, 118, 169),
+    "t1": (30, 144, 255),
+    "t2": (0, 255, 255),
+    "s1": (0, 150, 0),
+    "s2": (0, 255, 0),
+    "a1": (255, 0, 255),
+    "a2": (255, 0, 0),
+    "a3": (255, 255, 0),
 }
 EFE4_THEMES = {
     "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS_DARK, "line_width": 1,
