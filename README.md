@@ -37,6 +37,8 @@ To launch one of the live plotting interfaces, simply run the desired Python scr
 
 python MODSOM_liveplot_parallel.py --folder /data/path/.
 
+(converts every .modraw file in /data/path to NetCDF, written to a `netcdf` directory next to it, e.g. EPSI_PROCESSING/raw -> EPSI_PROCESSING/netcdf)
+
 python MODSOM_liveplot.py --file /data/path/filename (it will plot the data of that file)
 
 For real time 

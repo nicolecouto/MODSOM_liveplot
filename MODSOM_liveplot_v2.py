@@ -11,7 +11,8 @@ Applies the 4 performance fixes (while keeping all existing prints):
 Added Feature: Batch NetCDF conversion
 - Passing `--folder PATH` will run headlessly, converting all `.modraw` files
   into individual full-resolution `.nc` files and generating a single combined
-  `combined_1Hz.nc` file for the whole dataset.
+  `combined_1Hz.nc` file for the whole dataset. The `.nc` files go in a `netcdf`
+  directory next to PATH (e.g. EPSI_PROCESSING/raw -> EPSI_PROCESSING/netcdf).
 """
 
 import argparse
@@ -2370,6 +2371,13 @@ def write_netcdf_1hz(global_1hz: dict, out_path: str):
                 grp.createVariable(col, 'f8', ('time',))[:] = df_combined[col].values
 
 
+def netcdf_dir_for(folder_path: str) -> str:
+    """Output directory for NetCDF files: a `netcdf` directory next to the input folder,
+    e.g. ../EPSI_PROCESSING/raw -> ../EPSI_PROCESSING/netcdf. Keeps .nc files separate
+    from the .modraw files. abspath normalizes trailing "/" or "/." first."""
+    return os.path.join(os.path.dirname(os.path.abspath(folder_path)), "netcdf")
+
+
 def run_batch_conversion(folder_path: str):
     """Headless batch conversion loop."""
     print(f"\n--- Batch processing .modraw files in '{folder_path}' ---")
@@ -2378,18 +2386,22 @@ def run_batch_conversion(folder_path: str):
         print("No .modraw files found in the specified folder.")
         return
 
+    out_dir = netcdf_dir_for(folder_path)
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Writing NetCDF files to '{out_dir}'")
+
     global_1hz = {}
     for f in files:
         print(f"Parsing: {os.path.basename(f)}...")
         insts, proc_data = parse_file_sync(f)
 
-        out_nc = f.replace('.modraw', '.nc')
+        out_nc = os.path.join(out_dir, os.path.splitext(os.path.basename(f))[0] + '.nc')
         print(f"  -> Saving high-res data to: {os.path.basename(out_nc)}")
         save_to_netcdf(insts, proc_data, out_nc)
 
         downsample_and_accumulate(insts, proc_data, global_1hz)
 
-    combined_1hz_out = os.path.join(folder_path, "combined_1Hz.nc")
+    combined_1hz_out = os.path.join(out_dir, "combined_1Hz.nc")
     print(f"\nMerging 1Hz timeseries and saving to: {os.path.basename(combined_1hz_out)}...")
     write_netcdf_1hz(global_1hz, combined_1hz_out)
     print("Batch processing complete!\n")
