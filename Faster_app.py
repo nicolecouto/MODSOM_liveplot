@@ -859,17 +859,8 @@ def psd_fft(t: np.ndarray, y: np.ndarray) -> Tuple[Optional[np.ndarray], Optiona
 # -----------------------------
 # Colors
 # -----------------------------
-EFE4_COLORS = {
-    "t1": (255, 0, 0),
-    "t2": (255, 165, 0),
-    "s1": (0, 0, 255),
-    "s2": (0, 255, 255),
-    "a1": (0, 255, 0),
-    "a2": (255, 0, 255),
-    "a3": (139, 69, 19),
-}
-# Light mode uses MOD_fish_processing's channel colors (defineSignalColors in
-# MODvis_spectra.m / MODvis_timeseries.m) so shared screenshots match those plots.
+# MOD_fish_processing's channel colors (defineSignalColors in MODvis_spectra.m /
+# MODvis_timeseries.m), used as-is in light mode so shared screenshots match those plots.
 EFE4_COLORS_LIGHT = {
     "t1": (29, 78, 140),
     "t2": (78, 173, 173),
@@ -879,8 +870,16 @@ EFE4_COLORS_LIGHT = {
     "a2": (235, 64, 61),
     "a3": (245, 199, 118),
 }
+# Dark mode: same hues, but the three too dark to see on black (t1 navy, s1 dark green,
+# a1 dark purple) are blended 40% toward white; the rest are unchanged.
+EFE4_COLORS_DARK = {
+    **EFE4_COLORS_LIGHT,
+    "t1": (119, 149, 186),
+    "s1": (138, 182, 148),
+    "a1": (179, 118, 169),
+}
 EFE4_THEMES = {
-    "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS, "line_width": 1,
+    "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS_DARK, "line_width": 1,
              "noise_floors": [(150, 150, 150), (200, 100, 100), (100, 200, 100)],
              "grid": (60, 60, 60)},
     # Thicker lines in light mode: thin colored lines (esp. the pale s2/a3) wash out on white.
