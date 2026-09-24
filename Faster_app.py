@@ -12,9 +12,11 @@ Inputs supported (mutually exclusive):
 Speed design:
 - Fixed-size circular buffers (NumPy) for all channels (no dynamic list growth).
 - Batch append for EFE4/TTV where possible.
-- GUI plots only last --window seconds (default 5s) from ring buffers.
+- GUI plots only last --window seconds (default 5s) from ring buffers (TTV, VNAV).
 - EFE4 PSD uses a fixed sample count (--epsi-scan-length, default 1024), not a time
-  window, so every update has the same number of frequency bins.
+  window, so every update has the same number of frequency bins. The EFE4 time series
+  show 3 scan lengths: the newest one, which the PSD is taken from, after a dashed
+  line, and the previous 2 to its left for context.
 
 Serial stop:
 - When app exits, sends "som.stop\r\n" only if using --serial.
@@ -199,7 +201,12 @@ class Record:
 # Instrument buffers
 # -----------------------------
 class EFE4Buffers:
+    CHANNELS = ("t1", "t2", "s1", "s2", "a1", "a2", "a3")
+
     def __init__(self, capacity: int):
+        # Held by the writer around appending all eight buffers, and by
+        # snapshot_last_n, so a snapshot never sees some channels a record ahead.
+        self.lock = threading.Lock()
         self.t = RingBuffer(capacity, dtype=np.float64)
         self.t1 = RingBuffer(capacity, dtype=np.float32)
         self.t2 = RingBuffer(capacity, dtype=np.float32)
@@ -208,6 +215,15 @@ class EFE4Buffers:
         self.a1 = RingBuffer(capacity, dtype=np.float32)
         self.a2 = RingBuffer(capacity, dtype=np.float32)
         self.a3 = RingBuffer(capacity, dtype=np.float32)
+
+    def snapshot_last_n(self, n: int) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """Last n samples of time and every channel, all the same length and aligned."""
+        with self.lock:
+            t = np.empty(0)
+            ch = {}
+            for name in self.CHANNELS:
+                t, ch[name] = getattr(self, name).snapshot_last_n(self.t, n)
+        return t, ch
 
 
 class TTVBuffers:
@@ -699,10 +715,11 @@ class RecordProcessorThread(threading.Thread):
         a2 = volts_to_g(counts24_to_volts_unipolar(c[:, 5], ADC_VREF_ACCEL))
         a3 = volts_to_g(counts24_to_volts_unipolar(c[:, 6], ADC_VREF_ACCEL))
 
-        b.t.append_many(ts)
-        b.t1.append_many(t1); b.t2.append_many(t2)
-        b.s1.append_many(s1); b.s2.append_many(s2)
-        b.a1.append_many(a1); b.a2.append_many(a2); b.a3.append_many(a3)
+        with b.lock:
+            b.t.append_many(ts)
+            b.t1.append_many(t1); b.t2.append_many(t2)
+            b.s1.append_many(s1); b.s2.append_many(s2)
+            b.a1.append_many(a1); b.a2.append_many(a2); b.a3.append_many(a3)
 
     def _parse_ttv(self, rec: Record, b: TTVBuffers, tag: str):
         payload = rec.payload
@@ -852,6 +869,9 @@ EFE4_COLORS = {
     "a2": (255, 0, 255),
     "a3": (139, 69, 19),
 }
+EFE4_LEFT_AXIS_WIDTH = 90  # px, EFE4 time-series y-axes
+EFE4_PSD_YMIN = 1e-18      # lowest y shown on the EFE4 PSD panel
+EPOCH_MIN = 1e9            # timestamps at/after this (2001-09-09) are treated as real UTC
 TTV_TAG_COLORS = {"TTV1": (255, 0, 0), "TTV2": (0, 255, 0), "TTV3": (0, 0, 255)}
 VNAV_COLORS = {
     "mag_x": (255, 0, 0), "mag_y": (0, 255, 0), "mag_z": (0, 0, 255),
@@ -862,11 +882,28 @@ VNAV_COLORS = {
 # -----------------------------
 # GUI Windows
 # -----------------------------
+class TimeAxis(pg.AxisItem):
+    """Bottom axis for x in seconds after t0 (posix seconds). Labels ticks as UTC
+    HH:MM:SS when `absolute` is set, otherwise as plain seconds."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.t0 = 0.0
+        self.absolute = False
+
+    def tickStrings(self, values, scale, spacing):
+        if not self.absolute:
+            return super().tickStrings(values, scale, spacing)
+        out = []
+        for v in values:
+            s = datetime.fromtimestamp(self.t0 + v, tz=timezone.utc).strftime("%H:%M:%S.%f")
+            out.append(s[:-7] if spacing >= 1 else s[:-5])  # tenths only if ticks are sub-second
+        return out
+
+
 class EFE4Window(QtWidgets.QMainWindow):
-    def __init__(self, buf: EFE4Buffers, window_seconds: float = 5.0, epsi_scan_length: int = 1024):
+    def __init__(self, buf: EFE4Buffers, epsi_scan_length: int = 1024):
         super().__init__()
         self.buf = buf
-        self.window_seconds = float(window_seconds)
         self.epsi_scan_length = int(epsi_scan_length)
         self.setWindowTitle(f"EFE4 (fast) - epsi scan length {self.epsi_scan_length}")
 
@@ -878,23 +915,62 @@ class EFE4Window(QtWidgets.QMainWindow):
         layout.addLayout(left, 1)
         layout.addLayout(right, 1)
 
-        self.p_t = pg.PlotWidget(); self.p_t.addLegend(); left.addWidget(self.p_t)
-        self.p_s = pg.PlotWidget(); self.p_s.addLegend(); left.addWidget(self.p_s)
-        self.p_a = pg.PlotWidget(); self.p_a.addLegend(); left.addWidget(self.p_a)
-
-        self.c_t1 = self.p_t.plot([], [], pen=pg.mkPen(EFE4_COLORS["t1"]), name="t1")
-        self.c_t2 = self.p_t.plot([], [], pen=pg.mkPen(EFE4_COLORS["t2"]), name="t2")
-        self.c_s1 = self.p_s.plot([], [], pen=pg.mkPen(EFE4_COLORS["s1"]), name="s1")
-        self.c_s2 = self.p_s.plot([], [], pen=pg.mkPen(EFE4_COLORS["s2"]), name="s2")
-        self.c_a1 = self.p_a.plot([], [], pen=pg.mkPen(EFE4_COLORS["a1"]), name="a1")
-        self.c_a2 = self.p_a.plot([], [], pen=pg.mkPen(EFE4_COLORS["a2"]), name="a2")
-        self.c_a3 = self.p_a.plot([], [], pen=pg.mkPen(EFE4_COLORS["a3"]), name="a3")
+        # One panel per channel (a2/a3 share one), so each y-axis auto-scales to its own
+        # channel instead of being stretched by an offset between channels. Each shows
+        # 3 scan lengths; the PSD uses the newest one, to the right of a dashed line.
+        # X is linked across panels and set explicitly every update (mouse x zoom off),
+        # so all six always have the same limits; only the bottom panel shows time ticks.
+        panels = [("t1 [V]", ["t1"]), ("t2 [V]", ["t2"]),
+                  ("s1 [V]", ["s1"]), ("s2 [V]", ["s2"]),
+                  ("a1 [g]", ["a1"]), (None, ["a2", "a3"])]
+        self.curves = {}
+        self.scan_lines = []  # one per panel, at the start of the PSD scan
+        self.time_axis = TimeAxis(orientation="bottom")
+        first = None
+        scan_pen = pg.mkPen((200, 200, 200), style=QtCore.Qt.DashLine)
+        for i, (ylabel, names) in enumerate(panels):
+            last = i == len(panels) - 1
+            p = pg.PlotWidget(axisItems={"bottom": self.time_axis} if last else None)
+            p.setMouseEnabled(x=False, y=True)
+            if len(names) > 1:
+                # Color-code the channel names in the axis label instead of a legend,
+                # which would cover data in a panel this short.
+                ylabel = ", ".join(
+                    "<span style='color:#%02x%02x%02x'>%s</span>" % (*EFE4_COLORS[n], n)
+                    for n in names
+                ) + " [g]"
+            p.setLabel("left", ylabel)
+            # Fixed axis width keeps panels aligned and leaves room for long tick labels
+            # (e.g. "2.500013"); hideOverlappingLabels drops a tick label at the top or
+            # bottom edge rather than drawing it half clipped.
+            ax = p.getAxis("left")
+            ax.setWidth(EFE4_LEFT_AXIS_WIDTH)
+            ax.setStyle(hideOverlappingLabels=True)
+            p.enableAutoRange(axis="y")
+            p.setAutoVisible(y=True)
+            if first is None:
+                first = p
+            else:
+                p.setXLink(first)
+            if not last:
+                p.getAxis("bottom").setStyle(showValues=False)
+            for name in names:
+                self.curves[name] = p.plot([], [], pen=pg.mkPen(EFE4_COLORS[name]), name=name)
+            line = pg.InfiniteLine(angle=90, pen=scan_pen)
+            p.addItem(line, ignoreBounds=True)
+            self.scan_lines.append(line)
+            left.addWidget(p)
+        self.p_ts_first = first
+        self._time_label = None
 
         self.scan_info_label = QtWidgets.QLabel("scan center: -- | duration: -- | length: --")
         right.addWidget(self.scan_info_label)
 
         self.p_psd = pg.PlotWidget()
         self.p_psd.setLogMode(x=True, y=True)
+        # Log mode: view coordinates are log10, so this floors the y-axis at 1e-18
+        # while leaving the top free to auto-scale.
+        self.p_psd.setLimits(yMin=np.log10(EFE4_PSD_YMIN))
         self.p_psd.addLegend()
         right.addWidget(self.p_psd)
         self.psd = {
@@ -918,42 +994,50 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.timer.start(100)
 
     def update_plots(self):
-        t, y1 = self.buf.t1.snapshot_last_seconds(self.buf.t, self.window_seconds)
+        # One aligned snapshot of 3 scan lengths feeds both the time series and the PSD.
+        # The PSD uses a fixed sample count (epsi_scan_length), not a time window, so
+        # every update gets the same number of frequency bins.
+        n = self.epsi_scan_length
+        t, ch = self.buf.snapshot_last_n(3 * n)
         if t.size < 32:
             return
-        tr = t - t[0]
-        _, y2 = self.buf.t2.snapshot_last_seconds(self.buf.t, self.window_seconds)
-        _, s1 = self.buf.s1.snapshot_last_seconds(self.buf.t, self.window_seconds)
-        _, s2 = self.buf.s2.snapshot_last_seconds(self.buf.t, self.window_seconds)
-        _, a1 = self.buf.a1.snapshot_last_seconds(self.buf.t, self.window_seconds)
-        _, a2 = self.buf.a2.snapshot_last_seconds(self.buf.t, self.window_seconds)
-        _, a3 = self.buf.a3.snapshot_last_seconds(self.buf.t, self.window_seconds)
+        # The scan is the newest scan length; the 2 before it are context. Until 3 scan
+        # lengths have arrived (startup) there's less context to its left.
+        i0 = max(0, t.size - n)
 
-        self.c_t1.setData(tr, y1); self.c_t2.setData(tr, y2)
-        self.c_s1.setData(tr, s1); self.c_s2.setData(tr, s2)
-        self.c_a1.setData(tr, a1); self.c_a2.setData(tr, a2); self.c_a3.setData(tr, a3)
+        # x is seconds after a whole second, so integer ticks land on whole clock seconds.
+        t0 = np.floor(t[0])
+        absolute = t0 >= EPOCH_MIN
+        self.time_axis.t0 = t0
+        self.time_axis.absolute = absolute
+        time_label = "time [UTC]" if absolute else "time [s]"
+        if time_label != self._time_label:
+            self.time_axis.setLabel(time_label)
+            self._time_label = time_label
 
-        # PSD uses a fixed sample-count window (epsi_scan_length), not the time-based
-        # window above - every update gets the same number of frequency bins.
-        pt, py1 = self.buf.t1.snapshot_last_n(self.buf.t, self.epsi_scan_length)
+        x = t - t0
+        for name, arr in ch.items():
+            self.curves[name].setData(x, arr)
+        self.p_ts_first.setXRange(x[0], x[-1], padding=0)
+        for line in self.scan_lines:
+            line.setValue(x[i0])
+
+        pt = t[i0:]
         if pt.size >= 32:
-            _, py2 = self.buf.t2.snapshot_last_n(self.buf.t, self.epsi_scan_length)
-            _, ps1 = self.buf.s1.snapshot_last_n(self.buf.t, self.epsi_scan_length)
-            _, ps2 = self.buf.s2.snapshot_last_n(self.buf.t, self.epsi_scan_length)
-            _, pa1 = self.buf.a1.snapshot_last_n(self.buf.t, self.epsi_scan_length)
-            _, pa2 = self.buf.a2.snapshot_last_n(self.buf.t, self.epsi_scan_length)
-            _, pa3 = self.buf.a3.snapshot_last_n(self.buf.t, self.epsi_scan_length)
-
-            for name, arr in [("t1", py1), ("t2", py2), ("s1", ps1), ("s2", ps2),
-                               ("a1", pa1), ("a2", pa2), ("a3", pa3)]:
-                f, p = psd_fft(pt, arr.astype(np.float64))
+            for name, arr in ch.items():
+                f, p = psd_fft(pt, arr[i0:].astype(np.float64))
                 if f is not None:
                     self.psd[name].setData(f, p)
 
-            center_time = datetime.fromtimestamp((pt[0] + pt[-1]) / 2.0, tz=timezone.utc)
+            center = (pt[0] + pt[-1]) / 2.0
+            if absolute:
+                center_str = datetime.fromtimestamp(center, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
+            else:
+                center_str = f"{center:.3f} s"
             duration_s = pt[-1] - pt[0]
             self.scan_info_label.setText(
-                f"scan center: {center_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} UTC | "
+                f"scan center: {center_str} | "
                 f"duration: {duration_s:.3f} s | length: {pt.size} samples"
             )
 
@@ -1122,7 +1206,7 @@ class WindowManager(QtCore.QObject):
         if self.w_efe4 is None:
             b: EFE4Buffers = self.buffers["EFE4"]  # type: ignore
             if b.t.size() > 10:
-                self.w_efe4 = EFE4Window(b, self.window_seconds, self.epsi_scan_length)
+                self.w_efe4 = EFE4Window(b, self.epsi_scan_length)
                 self.w_efe4.show()
 
         if self.w_ttv is None:
@@ -1157,7 +1241,7 @@ def main():
                                             "always tails whichever file is currently newest")
 
     ap.add_argument("--baud", "-b", type=int, default=115200, help="Serial baudrate")
-    ap.add_argument("--window", type=float, default=5.0, help="Plot window seconds (default 5)")
+    ap.add_argument("--window", type=float, default=5.0, help="Plot window seconds for TTV/VNAV (default 5); EFE4 uses --epsi-scan-length")
     ap.add_argument("--buffer-seconds", type=float, default=15.0, help="Ring buffer duration (seconds)")
     ap.add_argument("--efe4-fs", type=float, default=320.0, help="EFE4 nominal sample rate for buffer sizing")
     ap.add_argument("--ttv-fs", type=float, default=50.0, help="TTV nominal sample rate for buffer sizing")
@@ -1173,7 +1257,8 @@ def main():
                      help="Sample count used for the EFE4 (epsi) PSD window (default 1024)")
     args = ap.parse_args()
 
-    cap_efe4 = max(1024, int(np.ceil(args.buffer_seconds * args.efe4_fs)), args.epsi_scan_length)
+    # EFE4 window shows 3 scan lengths (newest one used for the PSD), so the buffer must hold them.
+    cap_efe4 = max(1024, int(np.ceil(args.buffer_seconds * args.efe4_fs)), 3 * args.epsi_scan_length)
     cap_ttv = max(1024, int(np.ceil(args.buffer_seconds * args.ttv_fs)))
     cap_vnav = max(1024, int(np.ceil(args.buffer_seconds * args.vnav_fs)))
 
