@@ -868,6 +868,23 @@ EFE4_COLORS = {
     "a2": (255, 0, 255),
     "a3": (139, 69, 19),
 }
+# Light mode uses MOD_fish_processing's channel colors (defineSignalColors in
+# MODvis_spectra.m / MODvis_timeseries.m) so shared screenshots match those plots.
+EFE4_COLORS_LIGHT = {
+    "t1": (29, 78, 140),
+    "t2": (78, 173, 173),
+    "s1": (60, 134, 76),
+    "s2": (173, 215, 136),
+    "a1": (129, 27, 112),
+    "a2": (235, 64, 61),
+    "a3": (245, 199, 118),
+}
+EFE4_THEMES = {
+    "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS,
+             "noise_floors": [(150, 150, 150), (200, 100, 100), (100, 200, 100)]},
+    "light": {"bg": (255, 255, 255), "fg": (0, 0, 0), "colors": EFE4_COLORS_LIGHT,
+              "noise_floors": [(90, 90, 90), (180, 60, 60), (60, 140, 60)]},
+}
 EFE4_LEFT_AXIS_WIDTH = 90  # px, EFE4 time-series y-axes
 EFE4_PSD_YMIN = 1e-18      # EFE4 PSD panel y-range
 EFE4_PSD_YMAX = 1e0
@@ -880,35 +897,40 @@ VNAV_COLORS = {
 }
 
 
-def _readable_on_black(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
-    """Lighten dark colors (e.g. pure blue, brown) toward white so text in them is
-    legible on a black background; bright colors are returned unchanged."""
+def _readable_on(rgb: Tuple[int, int, int], dark_bg: bool) -> Tuple[int, int, int]:
+    """Text color for a channel label: lighten dark colors (e.g. pure blue) on a dark
+    background, darken light colors (e.g. pale yellow) on a light one, so the label is
+    legible; colors that already contrast are returned unchanged."""
     r, g, b = rgb
     luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
-    if luminance >= 0.45:
-        return rgb
-    return tuple(int(c + 0.5 * (255 - c)) for c in rgb)
+    if dark_bg and luminance < 0.45:
+        return tuple(int(c + 0.5 * (255 - c)) for c in rgb)
+    if not dark_bg and luminance > 0.55:
+        return tuple(int(c * 0.55) for c in rgb)
+    return rgb
 
 
 # -----------------------------
 # GUI Windows
 # -----------------------------
 class TimeAxis(pg.AxisItem):
-    """Bottom axis for x in seconds after t0 (posix seconds). Labels ticks as UTC
-    HH:MM:SS when `absolute` is set, otherwise as plain seconds."""
+    """Bottom axis for x in seconds after t0 (posix seconds, a whole second). Ticks only
+    at whole seconds, labeled as UTC HH:MM:SS when `absolute` is set, otherwise as plain
+    seconds - so labels never repeat and never need decimals."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.t0 = 0.0
         self.absolute = False
 
+    def tickSpacing(self, minVal, maxVal, size):
+        levels = [(sp, off) for sp, off in super().tickSpacing(minVal, maxVal, size) if sp >= 1]
+        return levels or [(1.0, 0.0)]
+
     def tickStrings(self, values, scale, spacing):
         if not self.absolute:
-            return super().tickStrings(values, scale, spacing)
-        out = []
-        for v in values:
-            s = datetime.fromtimestamp(self.t0 + v, tz=timezone.utc).strftime("%H:%M:%S.%f")
-            out.append(s[:-7] if spacing >= 1 else s[:-5])  # tenths only if ticks are sub-second
-        return out
+            return ["%d" % round(v) for v in values]
+        return [datetime.fromtimestamp(self.t0 + v, tz=timezone.utc).strftime("%H:%M:%S")
+                for v in values]
 
 
 class EFE4Window(QtWidgets.QMainWindow):
@@ -937,6 +959,8 @@ class EFE4Window(QtWidgets.QMainWindow):
         panels = [("t1", "V"), ("t2", "V"), ("s1", "V"), ("s2", "V"),
                   ("a1", "g"), ("a2", "g"), ("a3", "g")]
         self.curves = {}
+        self.corner_labels = {}
+        self.ts_plots = []
         self.time_axis = TimeAxis(orientation="bottom")
         first = None
         for i, (name, units) in enumerate(panels):
@@ -946,12 +970,11 @@ class EFE4Window(QtWidgets.QMainWindow):
             # Channel label written horizontally in the top-left corner rather than as a
             # rotated axis label, which got cut off in panels this short. With no axis
             # label, pyqtgraph also doesn't add its "(x1e-06)"-style multiplier, so tick
-            # labels are the real values. Black background keeps it readable over data.
-            corner = pg.LabelItem(
-                "<span style='background-color:#000000'>%s [%s]</span>" % (name, units),
-                color=_readable_on_black(EFE4_COLORS[name]), justify="left")
+            # labels are the real values. Text/background colors are set in apply_theme.
+            corner = pg.LabelItem("", justify="left")
             corner.setParentItem(p.getPlotItem().vb)
             corner.anchor(itemPos=(0, 0), parentPos=(0, 0), offset=(4, 0))
+            self.corner_labels[name] = (corner, units)
             # Fixed axis width keeps panels aligned and leaves room for long tick labels
             # (e.g. "2.500013"); hideOverlappingLabels drops a tick label at the top or
             # bottom edge rather than drawing it half clipped.
@@ -967,13 +990,24 @@ class EFE4Window(QtWidgets.QMainWindow):
                 p.setXLink(first)
             if not last:
                 p.getAxis("bottom").setStyle(showValues=False)
-            self.curves[name] = p.plot([], [], pen=pg.mkPen(EFE4_COLORS[name]), name=name)
+            self.curves[name] = p.plot([], [], name=name)
+            self.ts_plots.append(p)
             left.addWidget(p)
         self.p_ts_first = first
         self._time_label = None
 
+        top_row = QtWidgets.QHBoxLayout()
         self.scan_info_label = QtWidgets.QLabel("scan center: -- | duration: -- | length: --")
-        right.addWidget(self.scan_info_label)
+        top_row.addWidget(self.scan_info_label)
+        top_row.addStretch(1)
+        # Dark is easier on the eyes at sea; light is better for screenshots (e.g. Slack)
+        # and uses MOD_fish_processing's colors.
+        self.theme_button = QtWidgets.QPushButton()
+        self.theme_button.setCheckable(True)
+        self.theme_button.toggled.connect(
+            lambda light: self.apply_theme("light" if light else "dark"))
+        top_row.addWidget(self.theme_button)
+        right.addLayout(top_row)
 
         self.p_psd = pg.PlotWidget()
         self.p_psd.setLogMode(x=True, y=True)
@@ -984,27 +1018,44 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.p_psd.setYRange(ymin, ymax, padding=0)
         # Room above the plot so the top tick label (1e0) isn't cut off.
         self.p_psd.getPlotItem().layout.setContentsMargins(0, 12, 0, 0)
-        self.p_psd.addLegend()
+        self.psd_legend = self.p_psd.addLegend()
         right.addWidget(self.p_psd)
-        self.psd = {
-            "t1": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["t1"]), name="t1"),
-            "t2": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["t2"]), name="t2"),
-            "s1": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["s1"]), name="s1"),
-            "s2": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["s2"]), name="s2"),
-            "a1": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["a1"]), name="a1"),
-            "a2": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["a2"]), name="a2"),
-            "a3": self.p_psd.plot([], [], pen=pg.mkPen(EFE4_COLORS["a3"]), name="a3"),
-        }
-        pen24 = pg.mkPen((150, 150, 150), style=QtCore.Qt.DashLine)
-        pen20 = pg.mkPen((200, 100, 100), style=QtCore.Qt.DashLine)
-        pen16 = pg.mkPen((100, 200, 100), style=QtCore.Qt.DashLine)
-        self.nf24 = self.p_psd.plot([], [], pen=pen24, name="24-bit NF")
-        self.nf20 = self.p_psd.plot([], [], pen=pen20, name="20-bit NF")
-        self.nf16 = self.p_psd.plot([], [], pen=pen16, name="16-bit NF")
+        self.psd = {name: self.p_psd.plot([], [], name=name) for name in EFE4Buffers.CHANNELS}
+        self.nf24 = self.p_psd.plot([], [], name="24-bit NF")
+        self.nf20 = self.p_psd.plot([], [], name="20-bit NF")
+        self.nf16 = self.p_psd.plot([], [], name="16-bit NF")
+
+        self.apply_theme("dark")
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(100)
+
+    def apply_theme(self, theme: str):
+        """Recolor every panel for "dark" or "light" (see EFE4_THEMES)."""
+        th = EFE4_THEMES[theme]
+        dark = theme == "dark"
+        colors = th["colors"]
+        bg_hex = "#%02x%02x%02x" % th["bg"]
+        for p in self.ts_plots + [self.p_psd]:
+            p.setBackground(th["bg"])
+            for side in ("left", "bottom"):
+                ax = p.getAxis(side)
+                ax.setPen(th["fg"])
+                ax.setTextPen(th["fg"])
+        for name, (corner, units) in self.corner_labels.items():
+            corner.setText(
+                "<span style='background-color:%s'>%s [%s]</span>" % (bg_hex, name, units),
+                color=_readable_on(colors[name], dark))
+        for name in EFE4Buffers.CHANNELS:
+            self.curves[name].setPen(pg.mkPen(colors[name]))
+            self.psd[name].setPen(pg.mkPen(colors[name]))
+        for curve, rgb in zip((self.nf24, self.nf20, self.nf16), th["noise_floors"]):
+            curve.setPen(pg.mkPen(rgb, style=QtCore.Qt.DashLine))
+        self.psd_legend.setLabelTextColor(th["fg"])
+        for _, label in self.psd_legend.items:  # setLabelTextColor doesn't redraw existing labels
+            label.setText(label.text)
+        self.theme_button.setText("Dark mode" if not dark else "Light mode")
 
     def update_plots(self):
         # One aligned snapshot of the newest scan feeds both the time series and the PSD.
