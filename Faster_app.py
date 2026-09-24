@@ -885,11 +885,11 @@ EFE4_COLORS_DARK = {
 EFE4_THEMES = {
     "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS_DARK, "line_width": 1,
              "noise_floors": [(150, 150, 150), (200, 100, 100), (100, 200, 100)],
-             "grid": (60, 60, 60)},
+             "grid": (60, 60, 60), "checkbox": (110, 110, 110)},
     # Thicker lines in light mode: thin colored lines (esp. the pale s2/a3) wash out on white.
     "light": {"bg": (255, 255, 255), "fg": (0, 0, 0), "colors": EFE4_COLORS_LIGHT, "line_width": 2,
               "noise_floors": [(90, 90, 90), (180, 60, 60), (60, 140, 60)],
-              "grid": (215, 215, 215)},
+              "grid": (215, 215, 215), "checkbox": (160, 160, 160)},
 }
 EFE4_LEFT_AXIS_WIDTH = 90  # px, EFE4 time-series y-axes
 EFE4_PSD_YMIN = 1e-18      # EFE4 PSD panel y-range
@@ -1157,6 +1157,14 @@ class EFE4Window(QtWidgets.QMainWindow):
             self.psd_samples[name].setPen(curve.opts["pen"])
         for label in self.psd_names:
             label.setStyleSheet("color: #%02x%02x%02x;" % th["fg"])
+        # Small muted squares instead of the native (bright blue on macOS) checkbox, so
+        # the legend doesn't pull the eye from the data: filled = shown, outline = hidden.
+        muted = "#%02x%02x%02x" % th["checkbox"]
+        for cb in self.psd_checks.values():
+            cb.setStyleSheet(
+                "QCheckBox::indicator { width: 9px; height: 9px; border: 1px solid %s;"
+                " border-radius: 2px; background: transparent; }"
+                "QCheckBox::indicator:checked { background: %s; }" % (muted, muted))
         self.theme_button.setText("Dark mode" if not dark else "Light mode")
 
     def update_plots(self):
