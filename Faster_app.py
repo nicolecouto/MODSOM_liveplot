@@ -880,10 +880,13 @@ EFE4_COLORS_LIGHT = {
     "a3": (245, 199, 118),
 }
 EFE4_THEMES = {
-    "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS,
-             "noise_floors": [(150, 150, 150), (200, 100, 100), (100, 200, 100)]},
-    "light": {"bg": (255, 255, 255), "fg": (0, 0, 0), "colors": EFE4_COLORS_LIGHT,
-              "noise_floors": [(90, 90, 90), (180, 60, 60), (60, 140, 60)]},
+    "dark": {"bg": (0, 0, 0), "fg": (150, 150, 150), "colors": EFE4_COLORS, "line_width": 1,
+             "noise_floors": [(150, 150, 150), (200, 100, 100), (100, 200, 100)],
+             "grid": (60, 60, 60)},
+    # Thicker lines in light mode: thin colored lines (esp. the pale s2/a3) wash out on white.
+    "light": {"bg": (255, 255, 255), "fg": (0, 0, 0), "colors": EFE4_COLORS_LIGHT, "line_width": 2,
+              "noise_floors": [(90, 90, 90), (180, 60, 60), (60, 140, 60)],
+              "grid": (215, 215, 215)},
 }
 EFE4_LEFT_AXIS_WIDTH = 90  # px, EFE4 time-series y-axes
 EFE4_PSD_YMIN = 1e-18      # EFE4 PSD panel y-range
@@ -895,6 +898,13 @@ VNAV_COLORS = {
     "accel_x": (255, 0, 255), "accel_y": (0, 255, 255), "accel_z": (255, 255, 0),
     "gyro_x": (255, 165, 0), "gyro_y": (128, 0, 128), "gyro_z": (0, 128, 0),
 }
+
+
+def _pow10_label(e: int) -> str:
+    """Tick label for 10**e, e.g. "1", "10⁻⁶"."""
+    if e == 0:
+        return "1"
+    return "10" + str(e).translate(str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"))
 
 
 def _readable_on(rgb: Tuple[int, int, int], dark_bg: bool) -> Tuple[int, int, int]:
@@ -989,7 +999,10 @@ class EFE4Window(QtWidgets.QMainWindow):
             else:
                 p.setXLink(first)
             if not last:
+                # With values hidden pyqtgraph shrinks the axis to 0 px tall, which clips
+                # its line at the panel edge (only the tick marks show); a few px keeps it.
                 p.getAxis("bottom").setStyle(showValues=False)
+                p.getAxis("bottom").setHeight(4)
             self.curves[name] = p.plot([], [], name=name)
             self.ts_plots.append(p)
             left.addWidget(p)
@@ -1018,6 +1031,22 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.p_psd.setYRange(ymin, ymax, padding=0)
         # Room above the plot so the top tick label (1e0) isn't cut off.
         self.p_psd.getPlotItem().layout.setContentsMargins(0, 12, 0, 0)
+        # Explicit ticks (log mode: positions are log10 exponents) so which ticks are
+        # labeled is fixed, then a grid line at each labeled tick only - pyqtgraph's own
+        # grid would also draw one at every unlabeled minor tick.
+        x_major = range(-2, 4)     # 0.01 Hz .. 1 kHz, labeled
+        y_major = range(-18, 1, 2)  # 1e-18 .. 1e0, every other decade labeled
+        self.p_psd.getAxis("bottom").setTicks([
+            [(e, "%g" % 10.0 ** e) for e in x_major],
+            [(e + np.log10(m), "") for e in x_major for m in range(2, 10)]])
+        self.p_psd.getAxis("left").setTicks([
+            [(e, _pow10_label(e)) for e in y_major],
+            [(e, "") for e in range(-18, 1) if e % 2]])
+        self.psd_grid = ([pg.InfiniteLine(pos=e, angle=90, movable=False) for e in x_major]
+                         + [pg.InfiniteLine(pos=e, angle=0, movable=False) for e in y_major])
+        for line in self.psd_grid:
+            line.setZValue(-100)  # behind the spectra
+            self.p_psd.addItem(line, ignoreBounds=True)
         self.psd_legend = self.p_psd.addLegend()
         right.addWidget(self.p_psd)
         self.psd = {name: self.p_psd.plot([], [], name=name) for name in EFE4Buffers.CHANNELS}
@@ -1048,10 +1077,13 @@ class EFE4Window(QtWidgets.QMainWindow):
                 "<span style='background-color:%s'>%s [%s]</span>" % (bg_hex, name, units),
                 color=_readable_on(colors[name], dark))
         for name in EFE4Buffers.CHANNELS:
-            self.curves[name].setPen(pg.mkPen(colors[name]))
-            self.psd[name].setPen(pg.mkPen(colors[name]))
+            pen = pg.mkPen(colors[name], width=th["line_width"])
+            self.curves[name].setPen(pen)
+            self.psd[name].setPen(pen)
         for curve, rgb in zip((self.nf24, self.nf20, self.nf16), th["noise_floors"]):
             curve.setPen(pg.mkPen(rgb, style=QtCore.Qt.DashLine))
+        for line in self.psd_grid:
+            line.setPen(pg.mkPen(th["grid"]))
         self.psd_legend.setLabelTextColor(th["fg"])
         for _, label in self.psd_legend.items:  # setLabelTextColor doesn't redraw existing labels
             label.setText(label.text)
