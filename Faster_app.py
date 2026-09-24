@@ -1093,7 +1093,7 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.psd_toggles.setAttribute(QtCore.Qt.WA_StyledBackground, True)
         box = QtWidgets.QVBoxLayout(self.psd_toggles)
         box.setContentsMargins(6, 4, 8, 4)
-        box.setSpacing(0)
+        box.setSpacing(3)
         self.psd_checks = {}
         self.psd_samples = {}
         self.psd_names = []
@@ -1103,12 +1103,17 @@ class EFE4Window(QtWidgets.QMainWindow):
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(4)
             cb = QtWidgets.QCheckBox()
+            # The macOS style gives checkboxes a layout rect smaller than the widget, so the
+            # restyled box drew over the line sample; lay out by the real widget rect.
+            cb.setAttribute(QtCore.Qt.WA_LayoutUsesWidgetRect)
+            cb.setFixedSize(13, 13)
             cb.setChecked(True)
             cb.toggled.connect(curve.setVisible)
             sample = _LineSample()
             label = _ClickableLabel(name)
             label.clicked.connect(cb.toggle)
             row.addWidget(cb)
+            row.addSpacing(4)  # keep the box clear of the line sample
             row.addWidget(sample)
             row.addWidget(label)
             row.addStretch(1)
@@ -1165,6 +1170,7 @@ class EFE4Window(QtWidgets.QMainWindow):
                 "QCheckBox::indicator { width: 9px; height: 9px; border: 1px solid %s;"
                 " border-radius: 2px; background: transparent; }"
                 "QCheckBox::indicator:checked { background: %s; }" % (muted, muted))
+        self.psd_toggles.adjustSize()  # restyled contents change size; refit the panel
         self.theme_button.setText("Dark mode" if not dark else "Light mode")
 
     def update_plots(self):
