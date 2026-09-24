@@ -15,8 +15,7 @@ Speed design:
 - GUI plots only last --window seconds (default 5s) from ring buffers (TTV, VNAV).
 - EFE4 PSD uses a fixed sample count (--epsi-scan-length, default 1024), not a time
   window, so every update has the same number of frequency bins. The EFE4 time series
-  show 3 scan lengths: the newest one, which the PSD is taken from, after a dashed
-  line, and the previous 2 to its left for context.
+  show exactly that scan.
 
 Serial stop:
 - When app exits, sends "som.stop\r\n" only if using --serial.
@@ -870,7 +869,8 @@ EFE4_COLORS = {
     "a3": (139, 69, 19),
 }
 EFE4_LEFT_AXIS_WIDTH = 90  # px, EFE4 time-series y-axes
-EFE4_PSD_YMIN = 1e-18      # lowest y shown on the EFE4 PSD panel
+EFE4_PSD_YMIN = 1e-18      # EFE4 PSD panel y-range
+EFE4_PSD_YMAX = 1e0
 EPOCH_MIN = 1e9            # timestamps at/after this (2001-09-09) are treated as real UTC
 TTV_TAG_COLORS = {"TTV1": (255, 0, 0), "TTV2": (0, 255, 0), "TTV3": (0, 0, 255)}
 VNAV_COLORS = {
@@ -878,6 +878,17 @@ VNAV_COLORS = {
     "accel_x": (255, 0, 255), "accel_y": (0, 255, 255), "accel_z": (255, 255, 0),
     "gyro_x": (255, 165, 0), "gyro_y": (128, 0, 128), "gyro_z": (0, 128, 0),
 }
+
+
+def _readable_on_black(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    """Lighten dark colors (e.g. pure blue, brown) toward white so text in them is
+    legible on a black background; bright colors are returned unchanged."""
+    r, g, b = rgb
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    if luminance >= 0.45:
+        return rgb
+    return tuple(int(c + 0.5 * (255 - c)) for c in rgb)
+
 
 # -----------------------------
 # GUI Windows
@@ -906,6 +917,9 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.buf = buf
         self.epsi_scan_length = int(epsi_scan_length)
         self.setWindowTitle(f"EFE4 (fast) - epsi scan length {self.epsi_scan_length}")
+        # Tall enough for seven stacked time-series panels.
+        screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1400, screen.width()), int(0.9 * screen.height()))
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -915,37 +929,36 @@ class EFE4Window(QtWidgets.QMainWindow):
         layout.addLayout(left, 1)
         layout.addLayout(right, 1)
 
-        # One panel per channel (a2/a3 share one), so each y-axis auto-scales to its own
-        # channel instead of being stretched by an offset between channels. Each shows
-        # 3 scan lengths; the PSD uses the newest one, to the right of a dashed line.
-        # X is linked across panels and set explicitly every update (mouse x zoom off),
-        # so all six always have the same limits; only the bottom panel shows time ticks.
-        panels = [("t1 [V]", ["t1"]), ("t2 [V]", ["t2"]),
-                  ("s1 [V]", ["s1"]), ("s2 [V]", ["s2"]),
-                  ("a1 [g]", ["a1"]), (None, ["a2", "a3"])]
+        # One panel per channel, so each y-axis auto-scales to its own channel instead of
+        # being stretched by an offset between channels. Each shows exactly the scan the
+        # PSD is taken from. X is linked across panels and set explicitly every update
+        # (mouse x zoom off), so all seven always have the same limits; only the bottom
+        # panel shows time ticks.
+        panels = [("t1", "V"), ("t2", "V"), ("s1", "V"), ("s2", "V"),
+                  ("a1", "g"), ("a2", "g"), ("a3", "g")]
         self.curves = {}
-        self.scan_lines = []  # one per panel, at the start of the PSD scan
         self.time_axis = TimeAxis(orientation="bottom")
         first = None
-        scan_pen = pg.mkPen((200, 200, 200), style=QtCore.Qt.DashLine)
-        for i, (ylabel, names) in enumerate(panels):
+        for i, (name, units) in enumerate(panels):
             last = i == len(panels) - 1
             p = pg.PlotWidget(axisItems={"bottom": self.time_axis} if last else None)
             p.setMouseEnabled(x=False, y=True)
-            if len(names) > 1:
-                # Color-code the channel names in the axis label instead of a legend,
-                # which would cover data in a panel this short.
-                ylabel = ", ".join(
-                    "<span style='color:#%02x%02x%02x'>%s</span>" % (*EFE4_COLORS[n], n)
-                    for n in names
-                ) + " [g]"
-            p.setLabel("left", ylabel)
+            # Channel label written horizontally in the top-left corner rather than as a
+            # rotated axis label, which got cut off in panels this short. With no axis
+            # label, pyqtgraph also doesn't add its "(x1e-06)"-style multiplier, so tick
+            # labels are the real values. Black background keeps it readable over data.
+            corner = pg.LabelItem(
+                "<span style='background-color:#000000'>%s [%s]</span>" % (name, units),
+                color=_readable_on_black(EFE4_COLORS[name]), justify="left")
+            corner.setParentItem(p.getPlotItem().vb)
+            corner.anchor(itemPos=(0, 0), parentPos=(0, 0), offset=(4, 0))
             # Fixed axis width keeps panels aligned and leaves room for long tick labels
             # (e.g. "2.500013"); hideOverlappingLabels drops a tick label at the top or
             # bottom edge rather than drawing it half clipped.
             ax = p.getAxis("left")
             ax.setWidth(EFE4_LEFT_AXIS_WIDTH)
             ax.setStyle(hideOverlappingLabels=True)
+            ax.enableAutoSIPrefix(False)
             p.enableAutoRange(axis="y")
             p.setAutoVisible(y=True)
             if first is None:
@@ -954,11 +967,7 @@ class EFE4Window(QtWidgets.QMainWindow):
                 p.setXLink(first)
             if not last:
                 p.getAxis("bottom").setStyle(showValues=False)
-            for name in names:
-                self.curves[name] = p.plot([], [], pen=pg.mkPen(EFE4_COLORS[name]), name=name)
-            line = pg.InfiniteLine(angle=90, pen=scan_pen)
-            p.addItem(line, ignoreBounds=True)
-            self.scan_lines.append(line)
+            self.curves[name] = p.plot([], [], pen=pg.mkPen(EFE4_COLORS[name]), name=name)
             left.addWidget(p)
         self.p_ts_first = first
         self._time_label = None
@@ -968,9 +977,13 @@ class EFE4Window(QtWidgets.QMainWindow):
 
         self.p_psd = pg.PlotWidget()
         self.p_psd.setLogMode(x=True, y=True)
-        # Log mode: view coordinates are log10, so this floors the y-axis at 1e-18
-        # while leaving the top free to auto-scale.
-        self.p_psd.setLimits(yMin=np.log10(EFE4_PSD_YMIN))
+        # Fixed y-range so updates are directly comparable. Log mode: view coordinates
+        # are log10, so the limits are exponents; setLimits also stops zooming past them.
+        ymin, ymax = np.log10(EFE4_PSD_YMIN), np.log10(EFE4_PSD_YMAX)
+        self.p_psd.setLimits(yMin=ymin, yMax=ymax)
+        self.p_psd.setYRange(ymin, ymax, padding=0)
+        # Room above the plot so the top tick label (1e0) isn't cut off.
+        self.p_psd.getPlotItem().layout.setContentsMargins(0, 12, 0, 0)
         self.p_psd.addLegend()
         right.addWidget(self.p_psd)
         self.psd = {
@@ -994,16 +1007,12 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.timer.start(100)
 
     def update_plots(self):
-        # One aligned snapshot of 3 scan lengths feeds both the time series and the PSD.
+        # One aligned snapshot of the newest scan feeds both the time series and the PSD.
         # The PSD uses a fixed sample count (epsi_scan_length), not a time window, so
         # every update gets the same number of frequency bins.
-        n = self.epsi_scan_length
-        t, ch = self.buf.snapshot_last_n(3 * n)
+        t, ch = self.buf.snapshot_last_n(self.epsi_scan_length)
         if t.size < 32:
             return
-        # The scan is the newest scan length; the 2 before it are context. Until 3 scan
-        # lengths have arrived (startup) there's less context to its left.
-        i0 = max(0, t.size - n)
 
         # x is seconds after a whole second, so integer ticks land on whole clock seconds.
         t0 = np.floor(t[0])
@@ -1019,27 +1028,23 @@ class EFE4Window(QtWidgets.QMainWindow):
         for name, arr in ch.items():
             self.curves[name].setData(x, arr)
         self.p_ts_first.setXRange(x[0], x[-1], padding=0)
-        for line in self.scan_lines:
-            line.setValue(x[i0])
 
-        pt = t[i0:]
-        if pt.size >= 32:
-            for name, arr in ch.items():
-                f, p = psd_fft(pt, arr[i0:].astype(np.float64))
-                if f is not None:
-                    self.psd[name].setData(f, p)
+        for name, arr in ch.items():
+            f, p = psd_fft(t, arr.astype(np.float64))
+            if f is not None:
+                self.psd[name].setData(f, p)
 
-            center = (pt[0] + pt[-1]) / 2.0
-            if absolute:
-                center_str = datetime.fromtimestamp(center, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
-            else:
-                center_str = f"{center:.3f} s"
-            duration_s = pt[-1] - pt[0]
-            self.scan_info_label.setText(
-                f"scan center: {center_str} | "
-                f"duration: {duration_s:.3f} s | length: {pt.size} samples"
-            )
+        center = (t[0] + t[-1]) / 2.0
+        if absolute:
+            center_str = datetime.fromtimestamp(center, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
+        else:
+            center_str = f"{center:.3f} s"
+        duration_s = t[-1] - t[0]
+        self.scan_info_label.setText(
+            f"scan center: {center_str} | "
+            f"duration: {duration_s:.3f} s | length: {t.size} samples"
+        )
 
         f = np.logspace(-1, 2, 200)
         self.nf24.setData(f, np.full_like(f, 1e-12))
@@ -1257,8 +1262,7 @@ def main():
                      help="Sample count used for the EFE4 (epsi) PSD window (default 1024)")
     args = ap.parse_args()
 
-    # EFE4 window shows 3 scan lengths (newest one used for the PSD), so the buffer must hold them.
-    cap_efe4 = max(1024, int(np.ceil(args.buffer_seconds * args.efe4_fs)), 3 * args.epsi_scan_length)
+    cap_efe4 = max(1024, int(np.ceil(args.buffer_seconds * args.efe4_fs)), args.epsi_scan_length)
     cap_ttv = max(1024, int(np.ceil(args.buffer_seconds * args.ttv_fs)))
     cap_vnav = max(1024, int(np.ceil(args.buffer_seconds * args.vnav_fs)))
 
